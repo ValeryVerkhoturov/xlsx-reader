@@ -20,13 +20,15 @@ import (
 	"path"
 	"strconv"
 	"strings"
+
+	"github.com/yurij-lyubskij/xlsx-reader/zipstream"
 )
 
 // Reader provides forward-only, constant-memory access to any .xlsx
 // workbook. See OpenReader.
 type Reader struct {
-	zw  *zipWalker
-	cur *zipEntry // the entry backing the sheet currently being iterated, if any
+	zw  *zipstream.Walker
+	cur *zipstream.Entry // the entry backing the sheet currently being iterated, if any
 
 	workbookPath string            // "" until resolved from _rels/.rels; defaultWorkbookPath is assumed until then
 	wbSheets     []wbSheetRef      // nil until the workbook part has been parsed
@@ -53,7 +55,9 @@ type resolvedSheet struct {
 type ReaderOption func(*readerOptions)
 
 type readerOptions struct {
-	raw bool
+	raw           bool
+	zip64Mode     zipstream.Zip64Mode
+	decompressors map[uint16]zipstream.Decompressor
 }
 
 // RawCellValue controls whether numeric cells are returned as their raw
@@ -72,6 +76,65 @@ type readerOptions struct {
 func RawCellValue(raw bool) ReaderOption {
 	return func(o *readerOptions) {
 		o.raw = raw
+	}
+}
+
+// Zip64Mode controls how OpenReader resolves the one genuinely ambiguous
+// Zip64 scenario a forward-only ZIP reader can encounter — see
+// zipstream.Zip64Mode for the full explanation and WithZip64Mode to set
+// it. This is an alias for zipstream.Zip64Mode, so a zipstream.Zip64Mode
+// value works here directly and vice versa.
+type Zip64Mode = zipstream.Zip64Mode
+
+// Zip64Auto, Zip64Force32, and Zip64Force64 are the possible values of
+// Zip64Mode; see zipstream.Zip64Mode for what each means.
+const (
+	Zip64Auto    = zipstream.Zip64Auto
+	Zip64Force32 = zipstream.Zip64Force32
+	Zip64Force64 = zipstream.Zip64Force64
+)
+
+// WithZip64Mode overrides how OpenReader's underlying ZIP walker
+// resolves the one genuinely ambiguous Zip64 case it can encounter: a
+// streamed worksheet part whose local header signals Zip64 neither via
+// a sentinel size nor a Zip64 extra-field record. The default,
+// Zip64Auto, matches OpenReader's historical behavior (assume narrow,
+// 32-bit framing) exactly; pass Zip64Force64 if the source archive is
+// known or suspected to come from a writer (such as Go's own
+// archive/zip.Writer, streaming to a non-seekable destination) that can
+// produce this ambiguity.
+//
+// This applies to the whole workbook, not a single sheet: Zip64Force64
+// is only appropriate when every ambiguous worksheet part in the
+// archive genuinely needs wide framing, since a forward-only reader has
+// no way to tell which specific part needs it. See zipstream.Zip64Mode
+// for the full explanation.
+func WithZip64Mode(mode Zip64Mode) ReaderOption {
+	return func(o *readerOptions) {
+		o.zip64Mode = mode
+	}
+}
+
+// Decompressor is an alias for zipstream.Decompressor; see it and
+// WithDecompressor.
+type Decompressor = zipstream.Decompressor
+
+// WithDecompressor registers dcomp as the decompressor OpenReader's
+// underlying ZIP walker uses for method. Only needed when a workbook's
+// own parts use a compression method other than Store or Deflate —
+// exceedingly rare for real .xlsx files (Excel, LibreOffice, and every
+// other writer this package has been tested against use only those two)
+// but not forbidden by the ZIP or OOXML formats. See
+// zipstream.Decompressor and zipstream.WithDecompressor for the full
+// explanation, including the self-terminating-read requirement a
+// Decompressor must meet for a streamed worksheet part.
+func WithDecompressor(method uint16, dcomp Decompressor) ReaderOption {
+	return func(o *readerOptions) {
+		if o.decompressors == nil {
+			o.decompressors = make(map[uint16]Decompressor)
+		}
+
+		o.decompressors[method] = dcomp
 	}
 }
 
@@ -113,21 +176,40 @@ func RawCellValue(raw bool) ReaderOption {
 // back to a name and index derived from the archive itself (its part
 // path and the order worksheets appear in) rather than failing outright.
 //
+// Archive entries are read via the zipstream package's forward-only
+// Walker (github.com/yurij-lyubskij/xlsx-reader/zipstream), which OpenReader
+// consumes as a public, standalone API in its own right — it has nothing
+// xlsx-specific about it and can be used to stream-read any ZIP archive.
+//
 // Zip64 archives are supported when the local header itself signals
 // Zip64 (the common case: Excel, LibreOffice, and any writer with a
 // seekable destination). One narrow case doesn't: a streamed entry
 // whose writer never signaled Zip64 in the local header at all can
 // silently truncate the rest of the archive rather than error — see
-// zipWalker.next's doc comment for why this is undetectable without
-// buffering ahead, and how rare a combination of circumstances it
-// requires.
+// zipstream.Walker.Next's doc comment for why this is undetectable
+// without buffering ahead, and how rare a combination of circumstances
+// it requires. Use WithZip64Mode(Zip64Force64) to opt into resolving
+// that ambiguity correctly when the source archive is known or
+// suspected to hit it.
+//
+// Only Store and Deflate compression are understood without further
+// help — the only two methods any writer this package has been tested
+// against ever produces. Use WithDecompressor to add support for
+// another method a workbook's parts might use.
 func OpenReader(r io.Reader, opts ...ReaderOption) (*Reader, error) {
 	var o readerOptions
 	for _, opt := range opts {
 		opt(&o)
 	}
 
-	return &Reader{zw: newZipWalker(r), rawCellValue: o.raw}, nil
+	zwOpts := []zipstream.Option{zipstream.WithZip64Mode(o.zip64Mode)}
+	for method, dcomp := range o.decompressors {
+		zwOpts = append(zwOpts, zipstream.WithDecompressor(method, dcomp))
+	}
+
+	zw := zipstream.New(r, zwOpts...)
+
+	return &Reader{zw: zw, rawCellValue: o.raw}, nil
 }
 
 // Sheet describes one worksheet as returned by Reader.NextSheet. Its
@@ -139,7 +221,7 @@ type Sheet struct {
 	Index int // 1-based; from the workbook part's <sheets> order when known, otherwise the order worksheets appear in the archive
 
 	r      *Reader
-	entry  *zipEntry
+	entry  *zipstream.Entry
 	fmtCtx *formatContext
 	rows   *RowIterator // cached, so repeated Rows calls share one in-progress iterator
 }
@@ -170,7 +252,7 @@ func (r *Reader) NextSheet() (*Sheet, error) {
 	}
 
 	if r.cur != nil {
-		if err := r.cur.finish(); err != nil {
+		if err := r.cur.Finish(); err != nil {
 			return nil, err
 		}
 
@@ -178,7 +260,7 @@ func (r *Reader) NextSheet() (*Sheet, error) {
 	}
 
 	for {
-		name, entry, err := r.zw.next()
+		name, entry, err := r.zw.Next()
 		if err != nil {
 			return nil, err
 		}
@@ -195,7 +277,7 @@ func (r *Reader) NextSheet() (*Sheet, error) {
 				return nil, err
 			}
 
-			if err := entry.finish(); err != nil {
+			if err := entry.Finish(); err != nil {
 				return nil, err
 			}
 
@@ -209,7 +291,7 @@ func (r *Reader) NextSheet() (*Sheet, error) {
 				return nil, err
 			}
 
-			if err := entry.finish(); err != nil {
+			if err := entry.Finish(); err != nil {
 				return nil, err
 			}
 
@@ -223,7 +305,7 @@ func (r *Reader) NextSheet() (*Sheet, error) {
 				return nil, err
 			}
 
-			if err := entry.finish(); err != nil {
+			if err := entry.Finish(); err != nil {
 				return nil, err
 			}
 
@@ -236,7 +318,7 @@ func (r *Reader) NextSheet() (*Sheet, error) {
 				return nil, err
 			}
 
-			if err := entry.finish(); err != nil {
+			if err := entry.Finish(); err != nil {
 				return nil, err
 			}
 
@@ -262,7 +344,7 @@ func (r *Reader) NextSheet() (*Sheet, error) {
 			return sheet, nil
 
 		default:
-			if err := entry.finish(); err != nil {
+			if err := entry.Finish(); err != nil {
 				return nil, err
 			}
 		}
@@ -342,7 +424,7 @@ func fallbackSheetName(partPath string) string {
 // one from Sheet.Rows.
 type RowIterator struct {
 	dec        *xml.Decoder
-	entry      *zipEntry
+	entry      *zipstream.Entry
 	fc         *formatContext
 	lastNumber int
 	number     int
@@ -352,7 +434,7 @@ type RowIterator struct {
 	stale      bool
 }
 
-func newRowIterator(entry *zipEntry, fc *formatContext) *RowIterator {
+func newRowIterator(entry *zipstream.Entry, fc *formatContext) *RowIterator {
 	return &RowIterator{
 		dec:   xml.NewDecoder(entry),
 		entry: entry,
