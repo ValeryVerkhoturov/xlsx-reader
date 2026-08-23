@@ -164,17 +164,35 @@ func WithDecompressor(method uint16, dcomp Decompressor) ReaderOption {
 //   - number/date formatting (see RawCellValue) is basic and best
 //     effort: only a fixed set of built-in and date-like custom number
 //     formats are recognized, and it depends on xl/styles.xml having
-//     been seen already, same convention-not-guarantee caveat as sheet
-//     naming below.
+//     been seen already — see the archive-ordering caveat below, which
+//     applies to this exactly as it does to sheet naming.
 //
-// Sheet naming depends on the workbook part (conventionally
-// xl/workbook.xml) and its relationships file, which by near-universal
-// convention — Excel, LibreOffice, openpyxl, and every other writer this
-// package has been tested against — appear before any worksheet part,
-// though nothing in the ZIP or OPC formats mandates it. If a worksheet
-// is encountered before that metadata is available, its Sheet falls
-// back to a name and index derived from the archive itself (its part
-// path and the order worksheets appear in) rather than failing outright.
+// Sheet naming (Sheet.Name/Sheet.Index) depends on the workbook part
+// (conventionally xl/workbook.xml) and its relationships file having
+// already been parsed by the time a worksheet part is reached; number
+// and date formatting depend on xl/styles.xml the same way. Nothing in the
+// ZIP or OPC formats mandates writing that metadata before any worksheet
+// part, and — despite that being the natural assumption — it is not a
+// rare exception in practice: LibreOffice and OnlyOffice reliably write
+// xl/workbook.xml and xl/styles.xml first (verified against real output
+// from both), and Excel is conventionally assumed to as well, but
+// xuri/excelize, openpyxl, and WPS Office have all been observed doing
+// the exact opposite — every worksheet part before that metadata — as a
+// matter of course, not as a corner case; this has nothing to do with
+// being unable to seek back to patch an already-written part (all three
+// of those writers buffer the whole archive before writing it out) and
+// everything to do with the order each one simply chooses to emit parts
+// in, which OOXML leaves entirely up to the writer. When a worksheet is
+// reached before that metadata is available, its Sheet falls back to a
+// name/index derived from the archive itself (its part path and the
+// order worksheets appear in) rather than failing outright, and every
+// numeric/date cell on it stays raw regardless of RawCellValue — both
+// silently, with no error. Don't assume Sheet.Name, Sheet.Index, or a
+// RawCellValue(false) cell's formatting are meaningful for a workbook
+// from an unverified writer without checking; RawCellValue(true) plus
+// formatting the raw value yourself sidesteps the formatting half of
+// this entirely, since it never depends on xl/styles.xml having been
+// seen.
 //
 // Archive entries are read via the zipstream package's forward-only
 // Walker (github.com/yurij-lyubskij/xlsx-reader/zipstream), which OpenReader

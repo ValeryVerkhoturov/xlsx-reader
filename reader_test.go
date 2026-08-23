@@ -77,11 +77,13 @@ func worksheetXML(rows ...string) string {
 
 // buildFallbackNamingWorkbook hand-builds a minimal, valid .xlsx archive
 // (via the stdlib archive/zip) whose worksheet parts are written before
-// the workbook part and its relationships — a legal but unconventional
-// ZIP entry order, mirroring a writer that can't seek back to finish
-// xl/workbook.xml until every sheet has been streamed out. This exercises
-// the fallback (metadata not yet available) sheet-naming path in
-// TestReader_FallbackSheetNaming below.
+// the workbook part and its relationships — a legal ZIP entry order that
+// real writers (xuri/excelize, openpyxl, and WPS Office have all been
+// observed doing exactly this, as their normal behavior rather than an
+// edge case) produce routinely, not just a writer that can't seek back
+// to finish xl/workbook.xml until every sheet has been streamed out.
+// This exercises the fallback (metadata not yet available) sheet-naming
+// path in TestReader_FallbackSheetNaming below.
 func buildFallbackNamingWorkbook(t *testing.T, sheets [][]string) []byte {
 	t.Helper()
 
