@@ -91,9 +91,11 @@ func buildZip64Extra(uncompressed, compressed uint64, includeUncompressed, inclu
 // (so a test can set the Zip64 sentinel regardless of the real
 // compressed data), its extra field, and -- for a streamed entry --
 // whether the trailing data descriptor's size fields are 4 or 8 bytes
-// wide, independent of whether the header signaled Zip64 at all (needed
-// to construct the "no signal, but the descriptor is actually wide"
-// ambiguous case). compressed/crc/dataLen come from compressForTest.
+// wide, independent of whether the header signaled Zip64 at all. This
+// lets a test build a header-signaled-but-tiny entry (e.g. modeling
+// Python's zipfile force_zip64=True) that's still correctly read as
+// wide even though needsWideDescriptor's true-size fallback alone would
+// have said narrow. compressed/crc/dataLen come from compressForTest.
 func assembleLocalEntry(name string, compressed []byte, crc uint32, dataLen int, method uint16, streaming bool, headerCompSize, headerUncompSize uint32, extra []byte, wideDescriptor bool) []byte {
 	var header [30]byte
 	binary.LittleEndian.PutUint32(header[0:4], zipLocalFileHeaderSignature)
@@ -262,75 +264,103 @@ func TestWalker_Zip64Streaming_SignaledByExtraFieldOnly(t *testing.T) {
 	readAllAndFinish(t, entry, data)
 }
 
-// TestWalker_Zip64Streaming_UnsignaledAmbiguityTruncatesArchive
-// documents the one genuine gap this walker has under the default
-// Zip64Auto mode (see Walker.Next's doc comment): archive/zip.Writer
-// itself can stream an entry that turns out to need Zip64 without ever
-// signaling that in the local header (no sentinel, no extra record).
-// This isn't caught by the misread entry's own CRC-32 check -- CRC is
-// always the descriptor's first field, unaffected by the width of the
-// size fields that follow it -- so the mistake surfaces later and
-// worse: the leftover trailer bytes it leaves unconsumed swallow
-// whatever comes next, so a second, perfectly valid entry after it goes
-// entirely undetected (Next silently reports no more entries) rather
-// than raising an error. This test pins that actual (regrettable but
-// honest) default behavior rather than asserting a clean failure that
-// doesn't happen. See TestWalker_Zip64Streaming_ForcedWideResolvesAmbiguity
-// for how Zip64Force64 fixes this.
-func TestWalker_Zip64Streaming_UnsignaledAmbiguityTruncatesArchive(t *testing.T) {
-	first := []byte("streamed, actually wide descriptor, but nothing in the header says so")
+// TestNeedsWideDescriptor pins the boundary of needsWideDescriptor's
+// fallback rule directly, independent of any archive plumbing: a real
+// 32-bit size field tops out at zip32SizeSentinel-1, so that value must
+// still read as narrow while zip32SizeSentinel itself (in either the
+// uncompressed or the compressed count alone) must read as wide. A real
+// end-to-end fixture that actually crosses this ~4GiB boundary isn't
+// practical in a test (see TestWalker_Zip64NonStreaming's comment for
+// the same tradeoff elsewhere in this file), so this is the boundary's
+// only direct coverage; TestEntry_TracksTrueSizesForFallback below
+// covers the inputs it's fed in a real read.
+func TestNeedsWideDescriptor(t *testing.T) {
+	const justUnder = zip32SizeSentinel - 1
+
+	tests := []struct {
+		name                     string
+		uncompressed, compressed uint64
+		want                     bool
+	}{
+		{"both well under", 100, 100, false},
+		{"uncompressed just under threshold", justUnder, 100, false},
+		{"compressed just under threshold", 100, justUnder, false},
+		{"uncompressed at threshold", zip32SizeSentinel, 100, true},
+		{"compressed at threshold", 100, zip32SizeSentinel, true},
+		{"both at threshold", zip32SizeSentinel, zip32SizeSentinel, true},
+	}
+
+	for _, tt := range tests {
+		if got := needsWideDescriptor(tt.uncompressed, tt.compressed); got != tt.want {
+			t.Errorf("%s: needsWideDescriptor(%d, %d) = %v, want %v",
+				tt.name, tt.uncompressed, tt.compressed, got, tt.want)
+		}
+	}
+}
+
+// TestEntry_TracksTrueSizesForFallback pins the mechanism
+// needsWideDescriptor's fallback actually depends on: that
+// Entry.uncompressedN and Entry.compressedCounter.n reflect the entry's
+// real sizes exactly, not an estimate, once it's been fully read.
+// uncompressedN is just the running total Read hands back;
+// compressedCounter counts only what the decompressor actually consumed
+// from the underlying stream (per the io.ByteReader exact-consumption
+// property New's doc comment relies on) -- this test checks that count
+// against the real compressed length independently computed by
+// compressForTest, not just against "some positive number."
+func TestEntry_TracksTrueSizesForFallback(t *testing.T) {
+	data := []byte(strings.Repeat("true size tracking for the Zip64 fallback ", 50))
+	compressed, crc := compressForTest(t, data, Deflate)
+
+	// No header signal at all: ordinary streaming sizes (0), no extra
+	// field -- exactly the shape a genuinely unknown-size streamed entry
+	// has, and the one case where the fallback is ever consulted.
+	raw := assembleLocalEntry("xl/worksheets/sheet1.xml", compressed, crc, len(data), Deflate, true,
+		0, 0, nil, false)
+
+	w := New(bytes.NewReader(raw))
+
+	_, entry, err := w.Next()
+	if err != nil {
+		t.Fatalf("Next: %v", err)
+	}
+
+	readAllAndFinish(t, entry, data)
+
+	if entry.uncompressedN != int64(len(data)) {
+		t.Errorf("uncompressedN = %d, want %d", entry.uncompressedN, len(data))
+	}
+	if entry.compressedCounter == nil {
+		t.Fatal("compressedCounter = nil for a streaming deflate entry, want non-nil")
+	}
+	if entry.compressedCounter.n != int64(len(compressed)) {
+		t.Errorf("compressedCounter.n = %d, want %d", entry.compressedCounter.n, len(compressed))
+	}
+}
+
+// TestWalker_Zip64Streaming_UnsignaledFindsNextEntry covers the
+// realistic version of the scenario Walker.Next's doc comment
+// describes: a streamed entry whose local header gives no Zip64 signal
+// at all (ordinary streaming, sizes 0, no extra field -- exactly what
+// archive/zip.Writer itself produces for a normal-sized streamed entry,
+// and, per that doc comment, also what it produces for one that turns
+// out to need Zip64, just without ever saying so). Here the entry's true
+// size is small, so needsWideDescriptor's fallback correctly infers a
+// narrow descriptor and Next correctly finds the entry that follows --
+// proving the fallback doesn't regress the ordinary case while closing
+// the gap for the case that matters (an oversized entry, which the
+// boundary math in TestNeedsWideDescriptor pins directly since a real
+// ~4GiB fixture isn't practical here).
+func TestWalker_Zip64Streaming_UnsignaledFindsNextEntry(t *testing.T) {
+	first := []byte("streamed, no header signal, but genuinely small -- the common case")
 	firstCompressed, firstCRC := compressForTest(t, first, Deflate)
 	firstRaw := assembleLocalEntry("xl/worksheets/sheet1.xml", firstCompressed, firstCRC, len(first), Deflate, true,
-		0, 0, nil, true) // no extra field at all; wideDescriptor=true regardless
+		0, 0, nil, false)
 
 	second := []byte("a second, perfectly ordinary entry")
 	secondRaw := buildLocalEntry(t, "xl/worksheets/sheet2.xml", second, Deflate, true, true)
 
 	w := New(bytes.NewReader(append(firstRaw, secondRaw...)))
-
-	name, entry, err := w.Next()
-	if err != nil {
-		t.Fatalf("first Next: %v", err)
-	}
-	if name != "xl/worksheets/sheet1.xml" {
-		t.Fatalf("name = %q, want %q", name, "xl/worksheets/sheet1.xml")
-	}
-
-	readAllAndFinish(t, entry, first) // the misread entry's own CRC check still happens to pass
-
-	name2, entry2, err2 := w.Next()
-	if err2 != nil || entry2 != nil {
-		t.Fatalf("Next after an unsignaled Zip64 entry = (%q, %v, %v), want (\"\", nil, nil) -- "+
-			"the documented limitation is that the archive silently appears to end here instead of erroring",
-			name2, entry2, err2)
-	}
-}
-
-// TestWalker_Zip64Streaming_ForcedWideResolvesAmbiguity uses a fixture
-// like TestWalker_Zip64Streaming_UnsignaledAmbiguityTruncatesArchive's,
-// but constructs the Walker with WithZip64Mode(Zip64Force64) instead of
-// the default -- and confirms this actually resolves the ambiguity
-// correctly: not just does the first entry still read and CRC-check
-// fine, but a second entry after it, which the default mode silently
-// swallows, is now found and read correctly too.
-//
-// Zip64Force64 is a whole-Walker setting, not a per-entry one (a
-// forward-only reader has no way to ask "is this specific entry the one
-// that needs it"), so both entries here are given a wide descriptor --
-// representing an archive where every unsignaled streamed entry
-// genuinely needs wide framing, which is the scenario this mode is for.
-func TestWalker_Zip64Streaming_ForcedWideResolvesAmbiguity(t *testing.T) {
-	first := []byte("streamed, actually wide descriptor, but nothing in the header says so")
-	firstCompressed, firstCRC := compressForTest(t, first, Deflate)
-	firstRaw := assembleLocalEntry("xl/worksheets/sheet1.xml", firstCompressed, firstCRC, len(first), Deflate, true,
-		0, 0, nil, true) // no extra field at all; wideDescriptor=true regardless
-
-	second := []byte("a second entry, also using a wide descriptor with no header signal")
-	secondCompressed, secondCRC := compressForTest(t, second, Deflate)
-	secondRaw := assembleLocalEntry("xl/worksheets/sheet2.xml", secondCompressed, secondCRC, len(second), Deflate, true,
-		0, 0, nil, true)
-
-	w := New(bytes.NewReader(append(firstRaw, secondRaw...)), WithZip64Mode(Zip64Force64))
 
 	name, entry, err := w.Next()
 	if err != nil {
@@ -346,11 +376,8 @@ func TestWalker_Zip64Streaming_ForcedWideResolvesAmbiguity(t *testing.T) {
 	if err2 != nil {
 		t.Fatalf("second Next: %v", err2)
 	}
-	if entry2 == nil {
-		t.Fatal("second Next: entry = nil, want the second entry to be found (Zip64Force64 should resolve the ambiguity)")
-	}
 	if name2 != "xl/worksheets/sheet2.xml" {
-		t.Fatalf("name = %q, want %q", name2, "xl/worksheets/sheet2.xml")
+		t.Fatalf("second entry name = %q, want %q", name2, "xl/worksheets/sheet2.xml")
 	}
 
 	readAllAndFinish(t, entry2, second)

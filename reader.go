@@ -56,7 +56,6 @@ type ReaderOption func(*readerOptions)
 
 type readerOptions struct {
 	raw           bool
-	zip64Mode     zipstream.Zip64Mode
 	decompressors map[uint16]zipstream.Decompressor
 }
 
@@ -76,42 +75,6 @@ type readerOptions struct {
 func RawCellValue(raw bool) ReaderOption {
 	return func(o *readerOptions) {
 		o.raw = raw
-	}
-}
-
-// Zip64Mode controls how OpenReader resolves the one genuinely ambiguous
-// Zip64 scenario a forward-only ZIP reader can encounter — see
-// zipstream.Zip64Mode for the full explanation and WithZip64Mode to set
-// it. This is an alias for zipstream.Zip64Mode, so a zipstream.Zip64Mode
-// value works here directly and vice versa.
-type Zip64Mode = zipstream.Zip64Mode
-
-// Zip64Auto, Zip64Force32, and Zip64Force64 are the possible values of
-// Zip64Mode; see zipstream.Zip64Mode for what each means.
-const (
-	Zip64Auto    = zipstream.Zip64Auto
-	Zip64Force32 = zipstream.Zip64Force32
-	Zip64Force64 = zipstream.Zip64Force64
-)
-
-// WithZip64Mode overrides how OpenReader's underlying ZIP walker
-// resolves the one genuinely ambiguous Zip64 case it can encounter: a
-// streamed worksheet part whose local header signals Zip64 neither via
-// a sentinel size nor a Zip64 extra-field record. The default,
-// Zip64Auto, matches OpenReader's historical behavior (assume narrow,
-// 32-bit framing) exactly; pass Zip64Force64 if the source archive is
-// known or suspected to come from a writer (such as Go's own
-// archive/zip.Writer, streaming to a non-seekable destination) that can
-// produce this ambiguity.
-//
-// This applies to the whole workbook, not a single sheet: Zip64Force64
-// is only appropriate when every ambiguous worksheet part in the
-// archive genuinely needs wide framing, since a forward-only reader has
-// no way to tell which specific part needs it. See zipstream.Zip64Mode
-// for the full explanation.
-func WithZip64Mode(mode Zip64Mode) ReaderOption {
-	return func(o *readerOptions) {
-		o.zip64Mode = mode
 	}
 }
 
@@ -194,21 +157,26 @@ func WithDecompressor(method uint16, dcomp Decompressor) ReaderOption {
 // this entirely, since it never depends on xl/styles.xml having been
 // seen.
 //
+// Worksheet parts are primarily recognized by the xl/worksheets/*.xml
+// naming convention every tested writer uses, with the workbook's own
+// rels consulted as a second-chance check for a legal but
+// non-conventional path once that metadata has been parsed — so, per the
+// same archive-ordering caveat as above, a worksheet at a
+// non-conventional path is only found if the workbook part and its rels
+// were both read before it; otherwise it's silently skipped, with no
+// error and no Sheet returned for it.
+//
 // Archive entries are read via the zipstream package's forward-only
 // Walker (github.com/yurij-lyubskij/xlsx-reader/zipstream), which OpenReader
 // consumes as a public, standalone API in its own right — it has nothing
 // xlsx-specific about it and can be used to stream-read any ZIP archive.
 //
-// Zip64 archives are supported when the local header itself signals
-// Zip64 (the common case: Excel, LibreOffice, and any writer with a
-// seekable destination). One narrow case doesn't: a streamed entry
-// whose writer never signaled Zip64 in the local header at all can
-// silently truncate the rest of the archive rather than error — see
-// zipstream.Walker.Next's doc comment for why this is undetectable
-// without buffering ahead, and how rare a combination of circumstances
-// it requires. Use WithZip64Mode(Zip64Force64) to opt into resolving
-// that ambiguity correctly when the source archive is known or
-// suspected to hit it.
+// Zip64 archives are supported, including a streamed entry whose writer
+// never signaled Zip64 in its local header at all (which
+// archive/zip.Writer itself can produce) — see zipstream.Walker.Next's
+// doc comment for how that entry's true size, known with certainty once
+// it's been decompressed, resolves the ambiguity without needing the
+// central directory.
 //
 // Only Store and Deflate compression are understood without further
 // help — the only two methods any writer this package has been tested
@@ -220,7 +188,7 @@ func OpenReader(r io.Reader, opts ...ReaderOption) (*Reader, error) {
 		opt(&o)
 	}
 
-	zwOpts := []zipstream.Option{zipstream.WithZip64Mode(o.zip64Mode)}
+	var zwOpts []zipstream.Option
 	for method, dcomp := range o.decompressors {
 		zwOpts = append(zwOpts, zipstream.WithDecompressor(method, dcomp))
 	}
@@ -344,7 +312,7 @@ func (r *Reader) NextSheet() (*Sheet, error) {
 			r.cellXfs = cellXfs
 			r.stylesReady = true
 
-		case looksLikeWorksheetPart(name):
+		case looksLikeWorksheetPart(name) || r.isKnownWorksheetPath(name):
 			r.sheetsSeen++
 			r.cur = entry
 
@@ -384,18 +352,7 @@ func (r *Reader) expectedWorkbookPath() string {
 // worksheets have appeared in the archive.
 func (r *Reader) resolveSheet(partPath string) *Sheet {
 	if r.wbSheets != nil && r.relsMap != nil {
-		if r.targetIndex == nil {
-			r.targetIndex = make(map[string]resolvedSheet, len(r.wbSheets))
-
-			for i, s := range r.wbSheets {
-				target, ok := r.relsMap[s.rID]
-				if !ok {
-					continue
-				}
-
-				r.targetIndex[target] = resolvedSheet{name: s.name, index: i + 1}
-			}
-		}
+		r.ensureTargetIndex()
 
 		if rs, ok := r.targetIndex[partPath]; ok {
 			return &Sheet{Name: rs.name, Index: rs.index}
@@ -405,12 +362,54 @@ func (r *Reader) resolveSheet(partPath string) *Sheet {
 	return &Sheet{Name: fallbackSheetName(partPath), Index: r.sheetsSeen}
 }
 
+// ensureTargetIndex lazily builds r.targetIndex (part path ->
+// resolvedSheet) from r.wbSheets + r.relsMap the first time it's needed.
+// Callers must only invoke this once both are non-nil.
+func (r *Reader) ensureTargetIndex() {
+	if r.targetIndex != nil {
+		return
+	}
+
+	r.targetIndex = make(map[string]resolvedSheet, len(r.wbSheets))
+
+	for i, s := range r.wbSheets {
+		target, ok := r.relsMap[s.rID]
+		if !ok {
+			continue
+		}
+
+		r.targetIndex[target] = resolvedSheet{name: s.name, index: i + 1}
+	}
+}
+
+// isKnownWorksheetPath reports whether name is declared as a worksheet
+// part by the workbook's own metadata (its <sheets> list, resolved
+// through the workbook rels), independent of looksLikeWorksheetPart's
+// naming convention -- a second-chance check for a worksheet part at a
+// legal but non-conventional path. It requires both the workbook part and
+// its rels to have already been parsed by the time name is reached;
+// otherwise it reports false, the same ordering caveat that already
+// applies to sheet naming (see OpenReader's doc comment).
+func (r *Reader) isKnownWorksheetPath(name string) bool {
+	if r.wbSheets == nil || r.relsMap == nil {
+		return false
+	}
+
+	r.ensureTargetIndex()
+
+	_, ok := r.targetIndex[name]
+
+	return ok
+}
+
 // looksLikeWorksheetPart reports whether name is a direct child of
 // xl/worksheets/ named *.xml — the directory and naming convention
 // every OOXML writer this package has been tested against uses for
-// worksheet parts, and the only signal this reader needs to detect one:
-// unlike naming, it can't depend on the workbook's rels having been
-// parsed yet.
+// worksheet parts. This is the only signal available before the
+// workbook's rels have been parsed; NextSheet also consults
+// Reader.isKnownWorksheetPath as a second-chance check, once that
+// metadata is available, for a legal but non-conventional worksheet
+// path this naming check alone would miss.
 func looksLikeWorksheetPart(name string) bool {
 	const prefix = "xl/worksheets/"
 
@@ -550,7 +549,10 @@ type generalWorksheetCell struct {
 // buildRow converts a row's cells to gap-filled column text, resolving
 // each cell's position from its r attribute (e.g. "C5") rather than
 // assuming one <c> per column in order, since OOXML allows (and real
-// writers produce) sparse rows that skip empty cells entirely.
+// writers produce) sparse rows that skip empty cells entirely. Cells must
+// appear in strictly increasing column order (the OOXML convention every
+// tested writer follows) — an out-of-order or duplicate column reference
+// errors rather than silently overwriting or misplacing data.
 func buildRow(rAttr string, cells []generalWorksheetCell, fc *formatContext) (int, []string, error) {
 	number := 0
 
@@ -576,6 +578,10 @@ func buildRow(rAttr string, cells []generalWorksheetCell, fc *formatContext) (in
 			}
 
 			colIdx = idx
+		}
+
+		if colIdx < nextCol {
+			return 0, nil, fmt.Errorf("xlsx: row %s: cell %s is out of order or duplicates column %d", rAttr, c.R, nextCol-1)
 		}
 
 		for len(columns) < colIdx-1 {
@@ -660,7 +666,10 @@ func generalCellText(c generalWorksheetCell, fc *formatContext) (string, error) 
 		if c.V != "" {
 			return fc.formatCellValue(c.V, c.S), nil
 		}
-	case "str", "e":
+	case "str", "e", "d":
+		// "d" (ISO-8601 date, legal in transitional OOXML) is already
+		// display-ready text, not a numeric serial, so it's returned as-is
+		// rather than routed through fc.formatCellValue.
 		if c.V != "" {
 			return c.V, nil
 		}

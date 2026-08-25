@@ -4,6 +4,7 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
+	"strings"
 )
 
 // defaultStylesPath is the part path OpenReader recognizes for the
@@ -23,7 +24,8 @@ type styleSheetXML struct {
 	} `xml:"numFmts"`
 	CellXfs struct {
 		Xf []struct {
-			NumFmtID int `xml:"numFmtId,attr"`
+			NumFmtID          int    `xml:"numFmtId,attr"`
+			ApplyNumberFormat string `xml:"applyNumberFormat,attr"`
 		} `xml:"xf"`
 	} `xml:"cellXfs"`
 }
@@ -32,7 +34,11 @@ type styleSheetXML struct {
 // formats (numFmtId -> formatCode, for ids >= 164 by convention, though
 // nothing here enforces that) and its cellXfs list (style index ->
 // numFmtId; an <xf> with no numFmtId attribute defaults to 0/General,
-// matching the XML zero value).
+// matching the XML zero value). An <xf applyNumberFormat="0"/> (or
+// "false") means its numFmtId should not be applied, so that xf is
+// recorded as 0/General instead -- an <xf> with no applyNumberFormat
+// attribute at all keeps its numFmtId unchanged, matching every real
+// writer this package has been tested against.
 func parseStyles(r io.Reader) (numFmts map[int]string, cellXfs []int, err error) {
 	var doc styleSheetXML
 
@@ -47,7 +53,12 @@ func parseStyles(r io.Reader) (numFmts map[int]string, cellXfs []int, err error)
 
 	cellXfs = make([]int, len(doc.CellXfs.Xf))
 	for i, xf := range doc.CellXfs.Xf {
-		cellXfs[i] = xf.NumFmtID
+		id := xf.NumFmtID
+		if xf.ApplyNumberFormat == "0" || strings.EqualFold(xf.ApplyNumberFormat, "false") {
+			id = 0
+		}
+
+		cellXfs[i] = id
 	}
 
 	return numFmts, cellXfs, nil

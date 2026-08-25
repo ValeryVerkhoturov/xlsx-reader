@@ -207,6 +207,76 @@ func TestReader_FallbackSheetNaming(t *testing.T) {
 	}
 }
 
+// TestReader_NonConventionalWorksheetPath builds a workbook whose
+// worksheet part lives outside xl/worksheets/ (legal per OOXML, since
+// parts are resolved through relationships rather than fixed paths) but
+// is correctly declared in the workbook's rels, which are written before
+// the worksheet part. looksLikeWorksheetPart's naming convention alone
+// would miss this; Reader.isKnownWorksheetPath's rels-based second chance
+// must still find it.
+func TestReader_NonConventionalWorksheetPath(t *testing.T) {
+	const worksheetPath = "xl/sheets/data1.xml"
+
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	write := func(name, content string) {
+		t.Helper()
+		w, err := zw.Create(name)
+		if err != nil {
+			t.Fatalf("creating zip entry %q: %v", name, err)
+		}
+		if _, err := w.Write([]byte(content)); err != nil {
+			t.Fatalf("writing zip entry %q: %v", name, err)
+		}
+	}
+
+	rels := `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+		`<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
+		`<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="sheets/data1.xml"/>` +
+		`</Relationships>`
+
+	write("_rels/.rels", rootRelsXML)
+	write("xl/workbook.xml", minimalWorkbookPart(1))
+	write("xl/_rels/workbook.xml.rels", rels)
+	write(worksheetPath, worksheetXML(textCell("A1", "hello")))
+
+	if err := zw.Close(); err != nil {
+		t.Fatalf("closing zip writer: %v", err)
+	}
+
+	rd, err := OpenReader(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatalf("OpenReader: %v", err)
+	}
+
+	sheet, err := rd.NextSheet()
+	if err != nil {
+		t.Fatalf("NextSheet: %v", err)
+	}
+	if sheet == nil {
+		t.Fatal("NextSheet returned nil, want the non-conventional worksheet to still be found")
+	}
+	if sheet.Name != "Sheet1" {
+		t.Errorf("sheet.Name = %q, want %q", sheet.Name, "Sheet1")
+	}
+	if sheet.Index != 1 {
+		t.Errorf("sheet.Index = %d, want 1", sheet.Index)
+	}
+
+	got := collectRows(t, sheet)
+	if len(got) != 1 || !equalStrings(got[0], []string{"hello"}) {
+		t.Errorf("rows = %v, want [[hello]]", got)
+	}
+
+	sheet, err = rd.NextSheet()
+	if err != nil {
+		t.Fatalf("NextSheet at end: %v", err)
+	}
+	if sheet != nil {
+		t.Fatalf("NextSheet at end: got %+v, want nil", sheet)
+	}
+}
+
 // TestRowIterator_Number checks Number against a worksheet with a gap in
 // its row numbers (row "5" following row "1") and a row with no r
 // attribute at all, which must fall back to one past the previous row's
@@ -504,6 +574,40 @@ func TestBuildRow_GapFilling(t *testing.T) {
 	}
 }
 
+// TestBuildRow_OutOfOrderCellsRejected checks that a cell reference that
+// doesn't strictly increase the column (out-of-order or a duplicate)
+// errors instead of silently overwriting or misplacing data -- e.g. B1
+// followed by A1 must not let a later r-less cell (which continues from
+// nextCol) clobber B1's already-written slot.
+func TestBuildRow_OutOfOrderCellsRejected(t *testing.T) {
+	cases := []struct {
+		name  string
+		cells []generalWorksheetCell
+	}{
+		{"out of order", []generalWorksheetCell{
+			{R: "B1", T: "n", V: "2"},
+			{R: "A1", T: "n", V: "1"},
+		}},
+		{"duplicate column", []generalWorksheetCell{
+			{R: "A1", T: "n", V: "1"},
+			{R: "A1", T: "n", V: "1"},
+		}},
+		{"regression via r-less cell after out-of-order pair", []generalWorksheetCell{
+			{R: "B1", T: "n", V: "2"},
+			{R: "A1", T: "n", V: "1"},
+			{T: "n", V: "3"},
+		}},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if _, _, err := buildRow("1", c.cells, rawFormatContext); err == nil {
+				t.Fatal("buildRow: err = nil, want an out-of-order error")
+			}
+		})
+	}
+}
+
 func TestGeneralCellText(t *testing.T) {
 	// Style index 1 -> numFmtId 3 (built-in "#,##0"), for the formatting
 	// case below; every other case uses the default style 0 (General).
@@ -524,6 +628,7 @@ func TestGeneralCellText(t *testing.T) {
 		{"formula with cached value", generalWorksheetCell{T: "str", V: "3", F: "1+2"}, rawFormatContext, "3", false},
 		{"formula without cached value", generalWorksheetCell{F: "1+2"}, rawFormatContext, "=1+2", false},
 		{"error cell", generalWorksheetCell{T: "e", V: "#DIV/0!"}, rawFormatContext, "#DIV/0!", false},
+		{"ISO-8601 date cell", generalWorksheetCell{T: "d", V: "2024-01-15T00:00:00"}, rawFormatContext, "2024-01-15T00:00:00", false},
 		{"empty cell", generalWorksheetCell{}, rawFormatContext, "", false},
 		{"shared string rejected", generalWorksheetCell{R: "A1", T: "s", V: "0"}, rawFormatContext, "", true},
 		{"unsupported type rejected", generalWorksheetCell{R: "A1", T: "z"}, rawFormatContext, "", true},

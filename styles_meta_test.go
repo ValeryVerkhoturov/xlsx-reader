@@ -12,11 +12,13 @@ func TestParseStyles(t *testing.T) {
 		<numFmt numFmtId="164" formatCode="yyyy-mm-dd"/>
 		<numFmt numFmtId="165" formatCode="@"/>
 	</numFmts>
-	<cellXfs count="4">
+	<cellXfs count="6">
 		<xf numFmtId="0"/>
 		<xf numFmtId="3"/>
 		<xf/>
 		<xf numFmtId="164"/>
+		<xf numFmtId="164" applyNumberFormat="0"/>
+		<xf numFmtId="164" applyNumberFormat="false"/>
 	</cellXfs>
 </styleSheet>`
 
@@ -35,7 +37,9 @@ func TestParseStyles(t *testing.T) {
 		}
 	}
 
-	wantCellXfs := []int{0, 3, 0, 164} // the 3rd <xf> has no numFmtId attribute -> defaults to 0
+	// the 3rd <xf> has no numFmtId attribute -> defaults to 0; the 5th and
+	// 6th have applyNumberFormat="0"/"false" -> their numFmtId is ignored
+	wantCellXfs := []int{0, 3, 0, 164, 0, 0}
 	if !equalInts(cellXfs, wantCellXfs) {
 		t.Errorf("cellXfs = %v, want %v", cellXfs, wantCellXfs)
 	}

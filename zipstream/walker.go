@@ -5,11 +5,11 @@
 // output, it accepts both of ZIP's local-entry encodings (sizes known up
 // front in the local header, or deferred to a trailing data descriptor
 // for writers that can't seek back to patch the header), Zip64 sizes --
-// see Walker.Next's doc comment for the one genuine ambiguity that
-// remains for a forward-only reader, and Zip64Mode for the escape hatch
-// it offers -- and, natively, Store and Deflate compression; register a
-// Decompressor via WithDecompressor for any other method, or to override
-// either of those two.
+// see Walker.Next's doc comment for how a streamed entry's Zip64-ness is
+// resolved even when its local header gives no signal at all -- and,
+// natively, Store and Deflate compression; register a Decompressor via
+// WithDecompressor for any other method, or to override either of those
+// two.
 package zipstream
 
 import (
@@ -36,15 +36,13 @@ type Walker struct {
 	br  *bufio.Reader
 	cur *Entry // the still-open entry from the last Next call, if any
 
-	zip64Mode     Zip64Mode
 	decompressors map[uint16]Decompressor
 }
 
-// Option configures New. See WithZip64Mode and WithDecompressor.
+// Option configures New. See WithDecompressor.
 type Option func(*options)
 
 type options struct {
-	zip64Mode     Zip64Mode
 	decompressors map[uint16]Decompressor
 }
 
@@ -61,7 +59,7 @@ func New(r io.Reader, opts ...Option) *Walker {
 		opt(&o)
 	}
 
-	return &Walker{br: bufio.NewReader(r), zip64Mode: o.zip64Mode, decompressors: o.decompressors}
+	return &Walker{br: bufio.NewReader(r), decompressors: o.decompressors}
 }
 
 // Next finishes the previous entry (discarding any data the caller
@@ -79,36 +77,44 @@ func New(r io.Reader, opts ...Option) *Walker {
 // only-if-flagged rule Go's own archive/zip reader uses — this is
 // unambiguous and handles how Excel, LibreOffice, and virtually every
 // writer targeting a seekable destination signals Zip64. It is always
-// authoritative, regardless of Zip64Mode.
+// authoritative.
 //
 // Streamed entries (general-purpose bit 3, an unknown size deferred to
-// the trailing data descriptor) are a genuine exception: when
-// archive/zip.Writer itself streams an entry to a plain io.Writer and
-// only discovers after the fact that it needs Zip64, it does not go
-// back and signal that in the local header at all ("too late anyway",
-// per that package's own writeDataDescriptor comment) — the local
-// header gives a forward-only reader no way to know the trailing
-// descriptor will use 8-byte size fields instead of 4-byte ones. This
-// walker widens the descriptor when the local header signals Zip64 (a
-// sentinel size, or a Zip64 record present at all, even an empty
-// placeholder one some writers use precisely to flag this before sizes
-// are known) — and otherwise, when neither signal is present, falls
-// back to Zip64Mode: the default, Zip64Auto (and Zip64Force32,
-// stated explicitly), assumes narrow; Zip64Force64 assumes wide.
+// the trailing data descriptor) are trickier: when archive/zip.Writer
+// itself streams an entry to a plain io.Writer and only discovers after
+// the fact that it needs Zip64, it does not go back and signal that in
+// the local header at all ("too late anyway", per that package's own
+// writeDataDescriptor comment) — the local header alone gives a
+// forward-only reader no way to know the trailing descriptor will use
+// 8-byte size fields instead of 4-byte ones.
 //
-// Getting that fallback wrong is worse than an error: the misread
-// entry's own CRC-32 check still passes (the CRC is always the
-// descriptor's first field, unaffected by the width of the size fields
-// that follow it), so the mistake goes uncaught right there, leaving 8
-// or 16 leftover trailer bytes unconsumed immediately after. If the
-// archive happens to end there, nothing is even detectably wrong. If
-// another entry follows, those leftover bytes are almost certainly
-// mistaken for garbage rather than a local-file-header signature, which
-// makes Next silently report "no more entries" — silently truncating
-// the rest of the archive rather than raising an error. A caller who
-// knows or suspects the source archive comes from a Go-authored,
-// non-seekable-destination, streamed Zip64 write can use
-// WithZip64Mode(Zip64Force64) to resolve this correctly instead.
+// When the header does signal Zip64 (a sentinel size, or a Zip64 record
+// present at all, even an empty placeholder one some writers use
+// precisely to flag this before sizes are known) that signal is trusted
+// outright, since it can come from a writer that genuinely wants a wide
+// descriptor regardless of actual size (e.g. Python's zipfile with
+// force_zip64=True on a small file) — actual size can't override it.
+//
+// When the header gives no signal at all, Next falls back to the
+// entry's true sizes instead of guessing: decompression finishes before
+// Finish reads the trailer, and by then both the true uncompressed size
+// (Entry.uncompressedN, just the running total of bytes Read handed
+// back) and the true compressed size (Entry.compressedCounter, which
+// counts exactly what the decompressor consumed — no more, no less, per
+// the io.ByteReader guarantee described on New) are known with
+// certainty, not estimated. needsWideDescriptor then applies the same
+// rule the format itself uses for the sentinel: a real 32-bit field
+// tops out at zip32SizeSentinel-1, so a true size of zip32SizeSentinel
+// or more could only have been encoded with 8-byte fields. This is
+// exactly the scenario archive/zip.Writer's unsignaled streaming
+// produces (its choice of descriptor width is itself driven by whether
+// the real accumulated size overflowed 32 bits), so it resolves the
+// ambiguity with certainty for every writer that behaves rationally
+// about it. It would only be fooled by a writer that both omits any
+// header signal and still chooses wide descriptor fields for data that
+// didn't need them — a combination no known writer produces (a writer
+// deliberately choosing Zip64, per the force_zip64 case above, signals
+// it in the header precisely so a reader doesn't have to guess).
 //
 // # Compression methods
 //
@@ -200,21 +206,34 @@ func (w *Walker) Next() (name string, entry *Entry, err error) {
 		// Zip64 before the real sizes are known. Treat it as a reliable
 		// signal that the trailing data descriptor (if any) is widened.
 		zip64 = true
-	} else if w.zip64Mode == Zip64Force64 {
-		// No signal at all in the local header -- the one genuine
-		// ambiguity a forward-only reader can't resolve from the
-		// archive's own bytes. Zip64Force64 opts into assuming a wide
-		// trailing descriptor here instead of the Zip64Auto/
-		// Zip64Force32 default.
-		zip64 = true
 	}
 
-	var src io.Reader
+	var (
+		src               io.Reader
+		compressedCounter *countingByteReader
+	)
+
+	// A streaming entry's compressed source is wrapped to count bytes
+	// actually consumed, regardless of whether the header already
+	// signals Zip64: it's needed only as Entry.Finish's fallback signal
+	// when the header gave no signal at all (see Next's "Zip64"
+	// section), but tracking it is cheap enough to do unconditionally
+	// rather than threading that condition through every branch below.
+	if streaming {
+		compressedCounter = &countingByteReader{br: w.br}
+	}
 
 	if dcomp, ok := w.decompressors[method]; ok {
 		var compressedSrc io.Reader = w.br
 
-		if !streaming {
+		if streaming {
+			// For a streaming entry, no size is available to bound the
+			// input with -- registering for Store lifts the restriction
+			// below precisely because it hands the decompressor the raw
+			// shared stream and trusts it to self-terminate on its own,
+			// the same way flate.Reader does for Deflate.
+			compressedSrc = compressedCounter
+		} else {
 			// The compressed size is known up front for a non-streaming
 			// entry (from the header, or resolved via Zip64 above) --
 			// bound the decompressor's input to exactly that, so a
@@ -223,16 +242,15 @@ func (w *Walker) Next() (name string, entry *Entry, err error) {
 			compressedSrc = io.LimitReader(w.br, int64(compSize))
 		}
 
-		// For a streaming entry, no size is available to bound the
-		// input with -- registering for Store lifts the restriction
-		// below precisely because it hands the decompressor the raw
-		// shared stream and trusts it to self-terminate on its own, the
-		// same way flate.Reader does for Deflate.
 		src = dcomp(compressedSrc)
 	} else {
 		switch method {
 		case Deflate:
-			src = flate.NewReader(w.br)
+			if streaming {
+				src = flate.NewReader(compressedCounter)
+			} else {
+				src = flate.NewReader(w.br)
+			}
 		case Store:
 			if streaming {
 				return "", nil, fmt.Errorf("zipstream: archive entry %q combines stored compression with a streamed (unknown-size) encoding, which is not supported; register a Decompressor for method %d via WithDecompressor if your writer's stored streaming framing is self-terminating", name, Store)
@@ -245,17 +263,49 @@ func (w *Walker) Next() (name string, entry *Entry, err error) {
 	}
 
 	e := &Entry{
-		name:      name,
-		br:        w.br,
-		src:       src,
-		hasher:    crc32.NewIEEE(),
-		streaming: streaming,
-		zip64:     zip64,
-		wantCRC:   crc32Val,
+		name:              name,
+		br:                w.br,
+		src:               src,
+		hasher:            crc32.NewIEEE(),
+		streaming:         streaming,
+		zip64:             zip64,
+		compressedCounter: compressedCounter,
+		wantCRC:           crc32Val,
 	}
 	w.cur = e
 
 	return name, e, nil
+}
+
+// countingByteReader wraps a *bufio.Reader, counting bytes actually
+// consumed by its caller -- not bytes the bufio.Reader itself may have
+// prefetched from its underlying source into its internal buffer.
+// Implementing both io.Reader and io.ByteReader lets it stand in for br
+// as a decompressor's source without losing the exact-consumption
+// property New's doc comment relies on (flate.Reader, like any
+// self-terminating decompressor, only reads exactly as many bytes as
+// the compressed stream needs when its source is an io.ByteReader),
+// while letting Walker.Next learn a streamed entry's true compressed
+// size once decompression finishes.
+type countingByteReader struct {
+	br *bufio.Reader
+	n  int64
+}
+
+func (c *countingByteReader) Read(p []byte) (int, error) {
+	n, err := c.br.Read(p)
+	c.n += int64(n)
+
+	return n, err
+}
+
+func (c *countingByteReader) ReadByte() (byte, error) {
+	b, err := c.br.ReadByte()
+	if err == nil {
+		c.n++
+	}
+
+	return b, err
 }
 
 // Entry is one archive entry's decompressed data, readable exactly once
@@ -269,16 +319,26 @@ type Entry struct {
 	src       io.Reader
 	hasher    hash.Hash32
 	streaming bool
-	zip64     bool // widens the trailing data descriptor's size fields to 8 bytes each; see Walker.Next
-	wantCRC   uint32
-	drained   bool
-	finished  bool
+	zip64     bool // local header explicitly signaled Zip64 for the trailing descriptor; see Walker.Next
+
+	// compressedCounter is non-nil only for a streaming entry, and tracks
+	// its true compressed size for needsWideDescriptor's fallback when
+	// zip64 above is false (the header gave no signal at all).
+	// uncompressedN is that same fallback's other input, tracked
+	// unconditionally by Read since it costs nothing extra to maintain.
+	compressedCounter *countingByteReader
+	uncompressedN     int64
+
+	wantCRC  uint32
+	drained  bool
+	finished bool
 }
 
 func (e *Entry) Read(p []byte) (int, error) {
 	n, err := e.src.Read(p)
 	if n > 0 {
 		e.hasher.Write(p[:n])
+		e.uncompressedN += int64(n)
 	}
 
 	if err == io.EOF {
@@ -317,11 +377,24 @@ func (e *Entry) Finish() error {
 	wantCRC := e.wantCRC
 
 	if e.streaming {
+		// The local header may have said nothing about Zip64 at all (see
+		// Next's "Zip64" section) -- in that case, fall back to the
+		// entry's now-known true sizes rather than assuming non-Zip64.
+		zip64 := e.zip64
+		if !zip64 {
+			var compressedN int64
+			if e.compressedCounter != nil {
+				compressedN = e.compressedCounter.n
+			}
+
+			zip64 = needsWideDescriptor(uint64(e.uncompressedN), uint64(compressedN))
+		}
+
 		// Non-Zip64: crc32 + compressed size + uncompressed size, each a
 		// uint32 (12 bytes). Zip64: the two sizes widen to uint64 (20
 		// bytes total). Either way only the crc32 is actually used.
 		restLen := 12
-		if e.zip64 {
+		if zip64 {
 			restLen = 20
 		}
 

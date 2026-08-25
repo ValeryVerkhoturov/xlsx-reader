@@ -1,6 +1,7 @@
 package xlsx
 
 import (
+	"math"
 	"testing"
 	"time"
 )
@@ -145,6 +146,8 @@ func TestTranslateCustomDateCode_Success(t *testing.T) {
 		{"quoted literal", `yyyy-mm-dd"T"hh:mm:ss`, time.Date(2024, 1, 15, 9, 5, 3, 0, time.UTC), "2024-01-15T09:05:03"},
 		{"single m/d/yy", "m/d/yy", time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC), "1/15/24"},
 		{"subsecond + AM/PM", "h:mm:ss.00 AM/PM", time.Date(1, 1, 1, 13, 2, 3, 500000000, time.UTC), "1:02:03.50 PM"},
+		{"lowercase am/pm", "h:mm am/pm", time.Date(1, 1, 1, 13, 2, 0, 0, time.UTC), "1:02 pm"},
+		{"lowercase a/p", "h:mm a/p", time.Date(1, 1, 1, 13, 2, 0, 0, time.UTC), "1:02 p"},
 	}
 
 	for _, c := range cases {
@@ -208,6 +211,18 @@ func TestFormatNumeric_CustomDateCode(t *testing.T) {
 	// must fall back cleanly.
 	if _, ok := formatNumeric(999, 45306, false, custom); ok {
 		t.Error("formatNumeric for unknown custom id: ok = true, want false")
+	}
+}
+
+func TestFormatNumeric_CustomTimeOnlyRejectsNonFinite(t *testing.T) {
+	// A time-only custom code (no date token) must still reject NaN/Inf
+	// before reaching timeOfDayFromSerial, same as the date-bearing path.
+	custom := map[int]string{166: "h:mm"}
+
+	for _, v := range []float64{math.NaN(), math.Inf(1), math.Inf(-1), -1} {
+		if _, ok := formatNumeric(166, v, false, custom); ok {
+			t.Errorf("formatNumeric(166, %v, ...) ok = true, want false", v)
+		}
 	}
 }
 

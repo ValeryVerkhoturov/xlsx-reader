@@ -13,56 +13,17 @@ const (
 	zip32SizeSentinel = 0xFFFFFFFF
 )
 
-// Zip64Mode controls how Walker resolves the one genuinely ambiguous
-// Zip64 case: a streamed entry (general-purpose bit 3) whose local
-// header signals Zip64 neither via a sentinel size nor via a Zip64
-// extra-field record. It has NO effect on any other case — sentinel-
-// signaled and extra-field-signaled Zip64 are always honored exactly as
-// the archive declares, regardless of mode; see Walker.Next's doc
-// comment for why that detection is unambiguous and never overridden.
-//
-// It is a whole-Walker setting, set once via WithZip64Mode when the
-// Walker is constructed, applying identically to every ambiguous entry
-// the Walker encounters — a forward-only reader has no way to ask "is
-// this specific entry the one that actually needs wide framing" on a
-// per-entry basis. Zip64Force64 is therefore only appropriate when every
-// unsignaled streamed entry in the archive genuinely needs wide framing;
-// forcing it on an archive that mixes ordinary small streamed entries
-// with one that needs Zip64 will misparse the ordinary ones instead.
-type Zip64Mode int
-
-const (
-	// Zip64Auto (the default, and Zip64Mode's zero value) assumes a
-	// narrow (32-bit) trailing data descriptor in the ambiguous case —
-	// matching every other reader's behavior for a header with no Zip64
-	// signal at all. This is wrong for the one narrow scenario
-	// archive/zip.Writer itself can produce: a Zip64-sized entry
-	// streamed to a non-seekable io.Writer, which never signals Zip64
-	// in the local header because the writer discovers the need too
-	// late to go back and patch it ("too late anyway", per that
-	// package's own writeDataDescriptor comment).
-	Zip64Auto Zip64Mode = iota
-
-	// Zip64Force32 states Zip64Auto's ambiguous-case assumption
-	// explicitly rather than relying on the implicit default; behavior
-	// is identical to Zip64Auto.
-	Zip64Force32
-
-	// Zip64Force64 assumes a wide (8-byte) trailing data descriptor in
-	// the ambiguous case instead — use this when the archive is known
-	// or suspected to come from archive/zip.Writer streaming a
-	// Zip64-sized entry to a non-seekable destination.
-	Zip64Force64
-)
-
-// WithZip64Mode overrides how a Walker resolves the one genuinely
-// ambiguous Zip64 scenario described by Zip64Mode. The default,
-// Zip64Auto, matches this package's historical (pre-option) behavior
-// exactly.
-func WithZip64Mode(mode Zip64Mode) Option {
-	return func(o *options) {
-		o.zip64Mode = mode
-	}
+// needsWideDescriptor reports whether a streamed entry's true sizes --
+// only knowable with certainty once the entry has actually finished
+// decompressing -- require the trailing data descriptor's 8-byte Zip64
+// size fields. This is used only when the local header gave no Zip64
+// signal at all (see Walker.Next's "Zip64" section): it mirrors the
+// exact rule the format itself uses for the sentinel field -- a real
+// 32-bit size tops out at zip32SizeSentinel-1, so a true size of
+// zip32SizeSentinel or more could never have been encoded any other
+// way.
+func needsWideDescriptor(uncompressedN, compressedN uint64) bool {
+	return uncompressedN >= zip32SizeSentinel || compressedN >= zip32SizeSentinel
 }
 
 // parseZip64Extra scans extra (a local file header's raw extra field)

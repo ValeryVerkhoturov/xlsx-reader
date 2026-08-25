@@ -49,31 +49,11 @@ The trade for that generality is real, and deliberate:
 - **No shared strings** (see the warning above). A shared-strings table can legally appear anywhere in the archive, including after the sheet that references it, which would defeat a single forward pass — there's no way to support it without buffering the whole workbook first, which this package deliberately never does.
 - **Forward-only, archive order.** Because the ZIP central directory is never consulted, sheets come out of `NextSheet` in the order they physically appear in the archive, not in caller-chosen order, and a `Sheet` is only valid until the next `NextSheet` call — there's no going back to re-read one.
 - **Basic number/date formatting, not a general format-code engine.** By default (`RawCellValue(false)`, the zero value — matching [excelize](https://github.com/qax-os/excelize)'s option of the same name and default), a numeric cell whose style resolves to one of a fixed set of built-in number formats (plain/grouped numbers, percentages, the standard date/time formats) or a custom format code that looks date/time-like (e.g. a custom `"yyyy-mm-dd"`) is formatted accordingly; everything else — the default General format, an unrecognized custom code, currency/conditional/color formats, or `xl/styles.xml` simply not having been read yet by the time a sheet is reached — always returns the cell's raw stored text. Pass `RawCellValue(true)` to disable formatting entirely and always get raw text.
-- **Zip64, with one narrow gap.** Supported for the vast majority of real archives; one rare streamed-write case needs an explicit override — see [Forcing Zip64 interpretation](#forcing-zip64-interpretation).
+- **Zip64.** Supported, including a streamed entry that needs Zip64 without ever signaling so in its local header — the entry's true size, known with certainty once it's been decompressed, resolves that case without needing the central directory. See `zipstream.Walker.Next`'s doc comment for the mechanism.
 - **Sheet naming is best-effort.** Names and workbook order come from the workbook part (`xl/workbook.xml`) and its relationships file, which by near-universal convention appear before any worksheet part — but nothing mandates it. If a worksheet is encountered first, its `Sheet` falls back to a name/index derived from the archive itself (e.g. `xl/worksheets/sheet3.xml` → `"Sheet3"`, numbered by the order worksheets appeared).
 - **Only Store and Deflate compression natively.** The only two ZIP compression methods any real `.xlsx` writer this package has been tested against uses — see [Custom compression methods](#custom-compression-methods) to add another.
 
 ## Options
-
-### Forcing Zip64 interpretation
-
-Zip64 is detected directly from the archive (a sentinel size and/or a Zip64 extra field record in the local header) whenever the writer targets a seekable destination — Excel, LibreOffice, and effectively every real `.xlsx` writer. That detection is always authoritative.
-
-The one gap: a *streamed* entry (unknown size deferred to a trailing data descriptor) that needs Zip64 without ever signaling so in its local header can't be detected forward-only — notably something Go's own `archive/zip.Writer` can itself produce when writing to a non-seekable `io.Writer`. By default (`xlsx.Zip64Auto`) this can silently truncate the rest of the archive rather than error; it requires an unusual combination of circumstances (a non-seekable destination, an entry actually exceeding 4GB, and more archive content after it), documented in `zipstream.Walker.Next`'s doc comment rather than hidden. If the source archive is known or suspected to hit this, opt in to wide framing instead:
-
-```go
-rd, err := xlsx.OpenReader(in, xlsx.WithZip64Mode(xlsx.Zip64Force64))
-```
-
-`xlsx.Zip64Mode` has three values:
-
-| Value               | Behavior                                                                 |
-|---------------------|---------------------------------------------------------------------------|
-| `xlsx.Zip64Auto`    | Default. Assumes narrow (32-bit) framing when a streamed entry gives no Zip64 signal at all. |
-| `xlsx.Zip64Force32` | Same as `Zip64Auto`, stated explicitly.                                   |
-| `xlsx.Zip64Force64` | Assumes wide (8-byte) framing instead, for that same signal-less case.    |
-
-This is a whole-workbook setting, not per-sheet: only use `Zip64Force64` when every ambiguous worksheet part in the archive genuinely needs wide framing — a forward-only reader can't tell which specific one does.
 
 ### Custom compression methods
 
@@ -94,7 +74,7 @@ The returned reader must, like `flate.Reader`, know on its own where its compres
 ```go
 import "github.com/yurij-lyubskij/xlsx-reader/zipstream"
 
-w := zipstream.New(r) // r is any io.Reader; pass zipstream.WithZip64Mode(...) to override Zip64 detection
+w := zipstream.New(r) // r is any io.Reader
 
 for {
     name, entry, err := w.Next()

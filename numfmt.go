@@ -90,12 +90,12 @@ func formatNumeric(id int, v float64, date1904 bool, custom map[int]string) (str
 		return "", false
 	}
 
+	if v < 0 || math.IsNaN(v) || math.IsInf(v, 0) {
+		return "", false
+	}
+
 	t := timeOfDayFromSerial(v)
 	if hasDateToken(tokens) {
-		if v < 0 || math.IsNaN(v) || math.IsInf(v, 0) {
-			return "", false
-		}
-
 		t = dateFromSerial(v, date1904)
 	}
 
@@ -295,8 +295,12 @@ type dateToken struct {
 // basic translator can't confidently render: a bracketed section
 // ([Red], [h], [$-409], ...), a semicolon-separated multi-section code,
 // a numeric-format symbol (# 0 ? @ % $), an unterminated quote or
-// trailing backslash, or a letter/run this translator doesn't
-// recognize. The caller must fall back to raw text on ok=false, never
+// trailing backslash, an invalid run length for a recognized date letter
+// (y/m/d/h/s -- e.g. "yyy" or "mmmmm"), or an "A"/"a" not followed by a
+// valid AM/PM marker spelling ("AM/PM"/"A/P", case-insensitively). Any
+// other unrecognized character, including any other letter, is instead
+// treated as a literal (see the default case below) -- it does not cause
+// an abort. The caller must fall back to raw text on ok=false, never
 // guess.
 func translateCustomDateCode(code string) ([]dateToken, bool) {
 	runes := []rune(code)
@@ -332,14 +336,14 @@ func translateCustomDateCode(code string) ([]dateToken, bool) {
 		case c == '[' || c == ';' || c == '#' || c == '0' || c == '?' || c == '@' || c == '%' || c == '$':
 			return nil, false
 
-		case c == 'A':
+		case c == 'A' || c == 'a':
 			switch {
-			case hasRunePrefix(runes[i:], "AM/PM"):
-				tokens = append(tokens, dateToken{kind: tokAMPM, text: "AM/PM"})
-				i += len("AM/PM")
-			case hasRunePrefix(runes[i:], "A/P"):
-				tokens = append(tokens, dateToken{kind: tokAMPM, text: "A/P"})
-				i += len("A/P")
+			case hasRunePrefixFold(runes[i:], "AM/PM"):
+				tokens = append(tokens, dateToken{kind: tokAMPM, text: string(runes[i : i+5])})
+				i += 5
+			case hasRunePrefixFold(runes[i:], "A/P"):
+				tokens = append(tokens, dateToken{kind: tokAMPM, text: string(runes[i : i+3])})
+				i += 3
 			default:
 				return nil, false
 			}
@@ -386,14 +390,22 @@ func translateCustomDateCode(code string) ([]dateToken, bool) {
 	return tokens, true
 }
 
-func hasRunePrefix(s []rune, prefix string) bool {
+// hasRunePrefixFold reports whether s starts with prefix, comparing
+// ASCII letters case-insensitively (prefix is always plain ASCII --
+// "AM/PM" or "A/P" -- so a simple per-rune upper-case fold suffices).
+func hasRunePrefixFold(s []rune, prefix string) bool {
 	pr := []rune(prefix)
 	if len(s) < len(pr) {
 		return false
 	}
 
 	for i, r := range pr {
-		if s[i] != r {
+		c := s[i]
+		if c >= 'a' && c <= 'z' {
+			c -= 'a' - 'A'
+		}
+
+		if c != r {
 			return false
 		}
 	}
@@ -586,8 +598,11 @@ func renderDateTokens(tokens []dateToken, t time.Time) string {
 			if t.Hour() >= 12 {
 				label = "PM"
 			}
-			if tok.text == "A/P" {
+			if len(tok.text) <= 3 { // "A/P" or "a/p", vs. the 5-rune "AM/PM"/"am/pm"
 				label = label[:1]
+			}
+			if tok.text[0] >= 'a' {
+				label = strings.ToLower(label)
 			}
 			b.WriteString(label)
 		}
